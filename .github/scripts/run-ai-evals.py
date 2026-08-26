@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Run an Omni AI-eval prompt set and emit findings for diff-findings.py.
 
-Replaces the string-matching run-ai-queries.py harness with Omni's first-class
-Eval Runs API. A prompt set lives on the model (referenced by id); each prompt
-carries a natural-language `expectation` that an analysis judge scores the
-agent's answer against (0-1) -- no regex. `runs-create` accepts
-`run_config.branch_id`, so the run executes against the PR's Omni branch.
+Built on Omni's first-class Eval Runs API. A prompt set lives on the model
+(referenced by id); each prompt carries a natural-language `expectation` that
+an analysis judge scores the agent's answer against (0-1). `runs-create`
+accepts `run_config.branch_id`, so the run executes against the PR's Omni
+branch.
 
 This script runs the prompt set ONCE (against the given branch, or base when no
-branch id) and writes the same {issues, summary} shape run-ai-queries.py did, so
-the existing diff-findings.py / format-findings.py / validation-summary pipeline
-works unchanged. The CI job runs it twice (branch + base) and diffs for net-new
+branch id) and writes the {issues, summary} shape the
+diff-findings.py / format-findings.py / validation-summary pipeline
+consumes. The CI job runs it twice (branch + base) and diffs for net-new
 -- a prompt that fails on the branch but not base is a regression and blocks.
 
 A prompt is a FAILURE when its judge score is below OMNI_EVAL_THRESHOLD

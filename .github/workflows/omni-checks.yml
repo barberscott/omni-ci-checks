@@ -285,12 +285,12 @@ jobs:
           echo "No net-new failures."
 
   ai-evals:
-    # BRANCH-AWARE + BLOCKING. Replaces the string-matching ai-queries harness
-    # with Omni's first-class Eval Runs API: each prompt is answered by the agent
-    # and scored by an analysis judge (vs a regex). runs-create accepts
-    # run_config.branch_id, so the run executes against the PR's Omni branch and
-    # against base; we diff for net-new failures and fail on regression -- same
-    # contract as the model/content/reference validation jobs.
+    # BRANCH-AWARE + BLOCKING, built on Omni's first-class Eval Runs API: each
+    # prompt is answered by the agent and scored by an analysis judge.
+    # runs-create accepts run_config.branch_id, so the run executes against the
+    # PR's Omni branch and against base; we diff for net-new failures and fail
+    # on regression -- same contract as the model/content/reference validation
+    # jobs.
     #
     # The prompt set lives on the model; reference it via vars.OMNI_EVAL_PROMPT_SET_ID.
     # OPTIONAL: skips automatically when OMNI_EVAL_PROMPT_SET_ID isn't set.
@@ -369,26 +369,26 @@ jobs:
     # Scoped to files touched by this PR. BLOCKS on `error`-severity findings;
     # `warning`/`info` are advisory (reported, never fail the check).
     #
-    # V3 — live full skills:
+    # Standards sources:
     # - The authoritative best practices are the full skill docs from
-    #   exploreomni/omni-agent-skills, sparse-checked-out at `main` into
-    #   skills-src/ (omni-model-builder + omni-ai-optimizer, SKILL.md +
-    #   references). We track main intentionally — no version pin.
-    # - .github/best-practices/omni-models.md is kept ONLY as the stable
-    #   rule-id taxonomy + severity rubric + any company-specific overrides;
-    #   the substantive guidance now comes from the live skills.
+    #   exploreomni/omni-agent-skills, sparse-checked-out into skills-src/
+    #   (omni-model-builder + omni-ai-optimizer, SKILL.md + references).
+    #   Tracks main by default; pin with vars.OMNI_SKILLS_SHA.
+    # - .github/best-practices/omni-models.md supplies the stable rule-id
+    #   taxonomy, the severity rubric, and any company-specific overrides;
+    #   the substantive guidance comes from the live skills.
     # - The resolved skills commit is captured and shown in the comment footer
     #   so every review records exactly which skills revision it ran against.
     #
-    # Guardrails carried over from the post-23-minute-hang tightening:
+    # Guardrails (keep the agent bounded and predictable):
     # - Tools restricted to Read only (no Glob/Grep); Claude is given an
     #   explicit, enumerated list of files it may Read (the only files that
     #   exist under skills-src/ thanks to the sparse checkout).
     # - --max-turns caps Claude's tool-call loop.
-    # - show_full_output + track_progress for live debuggability.
+    # - show_full_output for live debuggability.
     # - classify_inline_comments off — we post our own sticky comment.
     # - Schema lives in the prompt body and we parse JSON out of Claude's
-    #   final message (the action's --json-schema flag is silently ignored).
+    #   final message (the action does not honor a schema flag via claude_args).
     # OPTIONAL: requires the CLAUDE_CODE_OAUTH_TOKEN secret; skips when unset.
     name: Best practices review
     # Fail fast: skip if the model itself has net-new validation errors.
@@ -544,9 +544,9 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: ${{ steps.build.outputs.prompt }}
           show_full_output: true
-          # track_progress disabled: it posts the action's OWN progress comment,
-          # which duplicated our sticky comment. We render our own comment + a
-          # Checks-API check run below, so we don't need the action's comment.
+          # track_progress off: it would post the action's own progress
+          # comment, duplicating the sticky comment + Checks-API check run
+          # this job renders below.
           track_progress: false
           classify_inline_comments: false
           claude_args: |

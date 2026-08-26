@@ -1,0 +1,754 @@
+name: Omni Checks
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write     # best-practices job emits a Checks-API check run with annotations
+  id-token: write   # required by anthropics/claude-code-action for OIDC token exchange
+
+concurrency:
+  group: omni-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Directory the Omni git integration writes model YAML into. Omni's default
+  # modelPath is `omni/<model name>`, so `omni` covers most repos; set the
+  # OMNI_MODEL_DIR repository variable if your modelPath lives elsewhere.
+  OMNI_MODEL_DIR: ${{ vars.OMNI_MODEL_DIR || 'omni' }}
+
+jobs:
+  detect-changes:
+    # Did this PR touch any Omni MODEL YAML? If not, there's nothing for the
+    # Omni validations to check, so skip them all (gating model-validate
+    # cascades to every job that `needs: model-validate`). Job-level skips
+    # count as success for required checks (unlike a workflow `paths:` filter,
+    # which would leave required checks unreported and block the PR).
+    name: Detect model changes
+    runs-on: ubuntu-latest
+    outputs:
+      model: ${{ steps.f.outputs.model }}
+      # Optional-feature gates. Secrets aren't readable in job-level `if:`
+      # expressions, so surface "is the Claude token configured?" as an output
+      # here; the best-practices job keys off it and skips cleanly when the
+      # token isn't set up.
+      has_claude: ${{ steps.f.outputs.has_claude }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: f
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HAS_CLAUDE: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          git fetch origin "$BASE_REF" --depth=50 || true
+          CHANGED=$(git diff --name-only "origin/${BASE_REF}...HEAD" \
+            -- "${OMNI_MODEL_DIR}/**/*.yaml" "${OMNI_MODEL_DIR}/**/*.yml" 2>/dev/null || true)
+          if [ -n "$CHANGED" ]; then
+            echo "Model YAML changed:"; echo "$CHANGED"
+            echo "model=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No model YAML changed — Omni validations will be skipped."
+            echo "model=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "has_claude=$HAS_CLAUDE" >> "$GITHUB_OUTPUT"
+
+  model-validate:
+    name: Model validation
+    # Skip the whole Omni-validation suite when no model YAML changed. This
+    # gate cascades: content/reference/ai/hygiene/best-practices all
+    # `needs: model-validate`, so they skip when this skips.
+    needs: detect-changes
+    if: needs.detect-changes.outputs.model == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Omni CLI
+        uses: ./.github/actions/setup-omni-cli
+        with:
+          base-url: ${{ vars.OMNI_BASE_URL }}
+          token: ${{ secrets.OMNI_TOKEN }}
+
+      - name: Resolve Omni branch
+        id: resolve
+        env:
+          OMNI_MODEL_ID: ${{ vars.OMNI_MODEL_ID }}
+          GIT_REF: ${{ github.head_ref }}
+        run: .github/scripts/resolve-omni-branch.sh
+
+      - name: Validate model on branch
+        env:
+          MODEL_ID: ${{ vars.OMNI_MODEL_ID }}
+          BRANCH_ID: ${{ steps.resolve.outputs.branch_id }}
+        run: |
+          set -euo pipefail
+          omni models validate "$MODEL_ID" --branchid "$BRANCH_ID" \
+            --compact -o json > branch.json
+          echo "Branch issue count: $(python3 -c 'import json;print(len(json.load(open(\"branch.json\"))))')"
+
+      - name: Validate model on base
+        env:
+          MODEL_ID: ${{ vars.OMNI_MODEL_ID }}
+        run: |
+          set -euo pipefail
+          omni models validate "$MODEL_ID" --compact -o json > base.json
+          echo "Base issue count: $(python3 -c 'import json;print(len(json.load(open(\"base.json\"))))')"
+
+      - name: Compute net-new
+        run: |
+          .github/scripts/diff-findings.py base.json branch.json model --out diff.json
+          python3 -c "
+          import json
+          d = json.load(open('diff.json'))
+          print(f\"base={d['base_total']} branch={d['branch_total']} \"
+                f\"net_new_errors={len(d['errors'])} net_new_warnings={len(d['warnings'])} \"
+                f\"fixed={len(d['fixed'])}\")
+          "
+
+      - name: Render comment body
+        run: |
+          .github/scripts/format-findings.py diff.json \
+            --title "Omni model validation" --out body.md
+          echo "----- body.md -----"
+          cat body.md
+
+      - name: Upload section artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: omni-section-01-model
+          path: diff.json
+          retention-days: 1
+
+      - name: Fail on net-new errors
+        run: |
+          set -euo pipefail
+          ERRORS=$(python3 -c "import json;print(len(json.load(open('diff.json'))['errors']))")
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "::error::$ERRORS net-new model validation error(s) introduced by this PR."
+            exit 1
+          fi
+          echo "No net-new errors."
+
+  content-validate:
+    name: Content validation
+    # Fail fast: skip if the model itself has net-new validation errors.
+    needs: model-validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Omni CLI
+        uses: ./.github/actions/setup-omni-cli
+        with:
+          base-url: ${{ vars.OMNI_BASE_URL }}
+          token: ${{ secrets.OMNI_TOKEN }}
+
+      - name: Resolve Omni branch
+        id: resolve
+        env:
+          OMNI_MODEL_ID: ${{ vars.OMNI_MODEL_ID }}
+          GIT_REF: ${{ github.head_ref }}
+        run: .github/scripts/resolve-omni-branch.sh
+
+      - name: Validate content on branch
+        env:
+          MODEL_ID: ${{ vars.OMNI_MODEL_ID }}
+          BRANCH_ID: ${{ steps.resolve.outputs.branch_id }}
+        run: |
+          set -euo pipefail
+          omni models content-validator-get "$MODEL_ID" \
+            --branch-id "$BRANCH_ID" \
+            --include-personal-folders true \
+            --compact -o json > branch.json
+
+      - name: Validate content on base
+        env:
+          MODEL_ID: ${{ vars.OMNI_MODEL_ID }}
+        run: |
+          set -euo pipefail
+          omni models content-validator-get "$MODEL_ID" \
+            --include-personal-folders true \
+            --compact -o json > base.json
+
+      - name: Compute net-new
+        run: |
+          .github/scripts/diff-findings.py base.json branch.json content --out diff.json
+          python3 -c "
+          import json
+          d = json.load(open('diff.json'))
+          print(f\"base={d['base_total']} branch={d['branch_total']} \"
+                f\"net_new_errors={len(d['errors'])} fixed={len(d['fixed'])}\")
+          "
+
+      - name: Render comment body
+        run: |
+          .github/scripts/format-findings.py diff.json \
+            --title "Omni content validation" --out body.md
+          echo "----- body.md -----"
+          cat body.md
+
+      - name: Upload section artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: omni-section-02-content
+          path: diff.json
+          retention-days: 1
+
+      - name: Fail on net-new errors
+        run: |
+          set -euo pipefail
+          ERRORS=$(python3 -c "import json;print(len(json.load(open('diff.json'))['errors']))")
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "::error::$ERRORS net-new content validation error(s) introduced by this PR."
+            exit 1
+          fi
+          echo "No net-new errors."
+
+  reference-queries:
+    name: Reference queries
+    # Fail fast: skip if the model itself has net-new validation errors.
+    needs: model-validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Omni CLI
+        uses: ./.github/actions/setup-omni-cli
+        with:
+          base-url: ${{ vars.OMNI_BASE_URL }}
+          token: ${{ secrets.OMNI_TOKEN }}
+
+      - name: Install PyYAML
+        run: pip install pyyaml
+
+      - name: Resolve Omni branch
+        id: resolve
+        env:
+          OMNI_MODEL_ID: ${{ vars.OMNI_MODEL_ID }}
+          GIT_REF: ${{ github.head_ref }}
+        run: .github/scripts/resolve-omni-branch.sh
+
+      - name: Run reference queries on branch
+        env:
+          MODEL_ID: ${{ vars.OMNI_MODEL_ID }}
+          BRANCH_ID: ${{ steps.resolve.outputs.branch_id }}
+        run: |
+          .github/scripts/run-reference-queries.py "$MODEL_ID" \
+            --branch-id "$BRANCH_ID" \
+            --out branch.json
+
+      - name: Run reference queries on base
+        env:
+          MODEL_ID: ${{ vars.OMNI_MODEL_ID }}
+        run: |
+          .github/scripts/run-reference-queries.py "$MODEL_ID" \
+            --out base.json
+
+      - name: Compute net-new
+        run: |
+          .github/scripts/diff-findings.py base.json branch.json queries --out diff.json
+          python3 -c "
+          import json
+          d = json.load(open('diff.json'))
+          print(f\"base={d['base_total']} branch={d['branch_total']} \"
+                f\"net_new_errors={len(d['errors'])} fixed={len(d['fixed'])}\")
+          "
+
+      - name: Render comment body
+        run: |
+          .github/scripts/format-findings.py diff.json \
+            --title "Omni reference queries" --out body.md
+          echo "----- body.md -----"
+          cat body.md
+
+      - name: Upload section artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: omni-section-03-reference
+          path: diff.json
+          retention-days: 1
+
+      - name: Fail on net-new errors
+        run: |
+          set -euo pipefail
+          ERRORS=$(python3 -c "import json;print(len(json.load(open('diff.json'))['errors']))")
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "::error::$ERRORS net-new reference query failure(s) introduced by this PR."
+            exit 1
+          fi
+          echo "No net-new failures."
+
+  ai-evals:
+    # BRANCH-AWARE + BLOCKING. Replaces the string-matching ai-queries harness
+    # with Omni's first-class Eval Runs API: each prompt is answered by the agent
+    # and scored by an analysis judge (vs a regex). runs-create accepts
+    # run_config.branch_id, so the run executes against the PR's Omni branch and
+    # against base; we diff for net-new failures and fail on regression -- same
+    # contract as the model/content/reference validation jobs.
+    #
+    # The prompt set lives on the model; reference it via vars.OMNI_EVAL_PROMPT_SET_ID.
+    # OPTIONAL: skips automatically when OMNI_EVAL_PROMPT_SET_ID isn't set.
+    name: AI evals
+    # Fail fast: skip if the model itself has net-new validation errors.
+    needs: model-validate
+    if: vars.OMNI_EVAL_PROMPT_SET_ID != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Omni CLI
+        uses: ./.github/actions/setup-omni-cli
+        with:
+          base-url: ${{ vars.OMNI_BASE_URL }}
+          token: ${{ secrets.OMNI_TOKEN }}
+
+      - name: Resolve Omni branch
+        id: resolve
+        env:
+          OMNI_MODEL_ID: ${{ vars.OMNI_MODEL_ID }}
+          GIT_REF: ${{ github.head_ref }}
+        run: .github/scripts/resolve-omni-branch.sh
+
+      - name: Run eval prompt set on branch
+        env:
+          PROMPT_SET_ID: ${{ vars.OMNI_EVAL_PROMPT_SET_ID }}
+          BRANCH_ID: ${{ steps.resolve.outputs.branch_id }}
+        run: |
+          .github/scripts/run-ai-evals.py "$PROMPT_SET_ID" \
+            --branch-id "$BRANCH_ID" \
+            --out branch.json
+
+      - name: Run eval prompt set on base
+        env:
+          PROMPT_SET_ID: ${{ vars.OMNI_EVAL_PROMPT_SET_ID }}
+        run: |
+          .github/scripts/run-ai-evals.py "$PROMPT_SET_ID" --out base.json
+
+      - name: Compute net-new
+        run: |
+          .github/scripts/diff-findings.py base.json branch.json ai-evals --out diff.json
+          python3 -c "
+          import json
+          d = json.load(open('diff.json'))
+          print(f\"base={d['base_total']} branch={d['branch_total']} \"
+                f\"net_new_errors={len(d['errors'])} fixed={len(d['fixed'])}\")
+          "
+
+      - name: Render comment body
+        run: |
+          .github/scripts/format-findings.py diff.json \
+            --title "Omni AI evals" --out body.md
+          echo "----- body.md -----"
+          cat body.md
+
+      - name: Upload section artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: omni-section-04-ai
+          path: diff.json
+          retention-days: 1
+
+      - name: Fail on net-new errors
+        run: |
+          set -euo pipefail
+          ERRORS=$(python3 -c "import json;print(len(json.load(open('diff.json'))['errors']))")
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "::error::$ERRORS net-new AI eval regression(s) introduced by this PR."
+            exit 1
+          fi
+          echo "No net-new regressions."
+
+  best-practices-review:
+    # Agentic review of the changed YAML against the FULL Omni agent skills.
+    # Scoped to files touched by this PR. BLOCKS on `error`-severity findings;
+    # `warning`/`info` are advisory (reported, never fail the check).
+    #
+    # V3 — live full skills:
+    # - The authoritative best practices are the full skill docs from
+    #   exploreomni/omni-agent-skills, sparse-checked-out at `main` into
+    #   skills-src/ (omni-model-builder + omni-ai-optimizer, SKILL.md +
+    #   references). We track main intentionally — no version pin.
+    # - .github/best-practices/omni-models.md is kept ONLY as the stable
+    #   rule-id taxonomy + severity rubric + any company-specific overrides;
+    #   the substantive guidance now comes from the live skills.
+    # - The resolved skills commit is captured and shown in the comment footer
+    #   so every review records exactly which skills revision it ran against.
+    #
+    # Guardrails carried over from the post-23-minute-hang tightening:
+    # - Tools restricted to Read only (no Glob/Grep); Claude is given an
+    #   explicit, enumerated list of files it may Read (the only files that
+    #   exist under skills-src/ thanks to the sparse checkout).
+    # - --max-turns caps Claude's tool-call loop.
+    # - show_full_output + track_progress for live debuggability.
+    # - classify_inline_comments off — we post our own sticky comment.
+    # - Schema lives in the prompt body and we parse JSON out of Claude's
+    #   final message (the action's --json-schema flag is silently ignored).
+    # OPTIONAL: requires the CLAUDE_CODE_OAUTH_TOKEN secret; skips when unset.
+    name: Best practices review
+    # Fail fast: skip if the model itself has net-new validation errors.
+    needs: [detect-changes, model-validate]
+    if: needs.detect-changes.outputs.has_claude == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Compute changed YAML
+        id: changed
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          git fetch origin "$BASE_REF" --depth=50 || true
+          FILES=$(git diff --name-only "origin/${BASE_REF}...HEAD" \
+            -- "${OMNI_MODEL_DIR}/**/*.yaml" "${OMNI_MODEL_DIR}/**/*.yml" 2>/dev/null || true)
+          echo "Changed YAML files:"
+          echo "$FILES"
+          {
+            echo "files<<EOF"
+            echo "$FILES"
+            echo "EOF"
+            echo "count=$(echo -n "$FILES" | grep -c '^' || true)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Short-circuit when no model YAML touched
+        id: skip
+        if: steps.changed.outputs.count == '0'
+        run: |
+          mkdir -p /tmp/bp
+          cat > /tmp/bp/findings.json <<'JSON'
+          {"summary":"No model YAML changed in this PR; skipping review.","findings":[]}
+          JSON
+
+      - name: Checkout full Omni agent skills
+        if: steps.changed.outputs.count != '0'
+        uses: actions/checkout@v6
+        with:
+          repository: exploreomni/omni-agent-skills
+          # Tracks main by default; set the OMNI_SKILLS_SHA repository
+          # variable to pin reviews to a specific skills revision.
+          ref: ${{ vars.OMNI_SKILLS_SHA || 'main' }}
+          path: skills-src
+          # Non-cone sparse checkout: grab only the two review-relevant skills
+          # plus the plugin manifest (for the version stamp). Keeps the tree
+          # tiny and bounds what Claude's Read tool can possibly touch.
+          sparse-checkout: |
+            skills/omni-model-builder
+            skills/omni-ai-optimizer
+            .claude-plugin/plugin.json
+          sparse-checkout-cone-mode: false
+
+      - name: Capture skills provenance
+        id: skills
+        if: steps.changed.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          SHA=$(git -C skills-src rev-parse HEAD)
+          SHORT=$(git -C skills-src rev-parse --short HEAD)
+          VER=$(python3 -c "import json;print(json.load(open('skills-src/.claude-plugin/plugin.json'))['version'])")
+          echo "Resolved omni-agent-skills: omni-analytics v$VER @ $SHA"
+          {
+            echo "sha=$SHA"
+            echo "short=$SHORT"
+            echo "version=$VER"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Derive cross-file context paths
+        id: ctx
+        if: steps.changed.outputs.count != '0'
+        # For each changed file, walk up to the model root (the nearest
+        # ancestor directory containing model.yaml) and offer that model's
+        # model.yaml + relationships.yaml as optional cross-file context.
+        env:
+          CHANGED_FILES: ${{ steps.changed.outputs.files }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' > /tmp/bp-context.txt
+          import os
+          ctx = []
+          for f in (os.environ.get("CHANGED_FILES") or "").splitlines():
+              f = f.strip()
+              if not f:
+                  continue
+              d = os.path.dirname(f)
+              while d:
+                  if os.path.isfile(os.path.join(d, "model.yaml")):
+                      for name in ("model.yaml", "relationships.yaml"):
+                          p = os.path.join(d, name)
+                          if os.path.isfile(p) and p not in ctx:
+                              ctx.append(p)
+                      break
+                  d = os.path.dirname(d)
+          print("\n".join(ctx))
+          PY
+          echo "Cross-file context:"; cat /tmp/bp-context.txt
+
+      - name: Build review prompt
+        id: build
+        if: steps.changed.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/bp
+          {
+            cat .github/prompts/best-practices-review.md
+            echo
+            echo "## Files you may Read"
+            echo
+            echo "Authoritative best practices — the FULL Omni agent skills"
+            echo "(READ THESE FIRST; they are the source of truth):"
+            echo "- skills-src/skills/omni-model-builder/SKILL.md"
+            echo "- skills-src/skills/omni-model-builder/references/modelParameters.md"
+            echo "- skills-src/skills/omni-model-builder/references/yaml-filter-syntax.md"
+            echo "- skills-src/skills/omni-model-builder/references/topic-scoped-views.md"
+            echo "- skills-src/skills/omni-model-builder/references/topic-scoped-relationships.md"
+            echo "- skills-src/skills/omni-model-builder/references/query-view-examples.md"
+            echo "- skills-src/skills/omni-ai-optimizer/SKILL.md"
+            echo
+            echo "Rule-id taxonomy, severity rubric, and any company-specific"
+            echo "overrides (use these rule ids verbatim when labeling findings):"
+            echo "- .github/best-practices/omni-models.md"
+            echo
+            echo "Changed files (the review subject):"
+            while IFS= read -r f; do
+              [ -n "$f" ] && echo "- $f"
+            done <<<"${{ steps.changed.outputs.files }}"
+            echo
+            echo "Optionally, for cross-file context only when a finding needs it:"
+            while IFS= read -r f; do
+              [ -n "$f" ] && echo "- $f"
+            done < /tmp/bp-context.txt
+            echo
+            echo "Do not Read any other path. Your final message must be the"
+            echo "JSON document only — no prose, no code fences."
+          } > /tmp/bp/prompt.md
+          echo "----- prompt.md -----"
+          cat /tmp/bp/prompt.md
+          {
+            echo "prompt<<PROMPTEOF"
+            cat /tmp/bp/prompt.md
+            echo "PROMPTEOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run Claude review
+        id: claude
+        if: steps.changed.outputs.count != '0'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ steps.build.outputs.prompt }}
+          show_full_output: true
+          # track_progress disabled: it posts the action's OWN progress comment,
+          # which duplicated our sticky comment. We render our own comment + a
+          # Checks-API check run below, so we don't need the action's comment.
+          track_progress: false
+          classify_inline_comments: false
+          claude_args: |
+            --allowedTools Read
+            --max-turns 20
+
+      - name: Capture Claude output
+        if: steps.changed.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/bp
+          # The action exposes the execution stream as execution_file. Parse
+          # it to find Claude's final assistant message and extract the JSON.
+          python3 .github/scripts/extract-claude-json.py \
+            --execution-file '${{ steps.claude.outputs.execution_file }}' \
+            --structured-output '${{ steps.claude.outputs.structured_output }}' \
+            --out /tmp/bp/findings.json \
+            --usage-out /tmp/bp/usage.json
+          echo "----- findings.json -----"
+          cat /tmp/bp/findings.json
+          echo "----- usage.json -----"
+          cat /tmp/bp/usage.json
+
+      - name: Fetch prior BP comment (for the resolved ledger)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/bp
+          gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            --paginate > /tmp/bp/comments.json || echo '[]' > /tmp/bp/comments.json
+          python3 .github/scripts/extract-bp-prior.py \
+            --comments /tmp/bp/comments.json --out /tmp/bp/prior.json
+          echo "----- prior.json -----"; cat /tmp/bp/prior.json
+
+      - name: Render comment body
+        env:
+          # Stamps the comment footer with the exact skills revision reviewed
+          # against. Empty on the no-change short-circuit path (no footer then).
+          SKILLS_VERSION: ${{ steps.skills.outputs.version }}
+          SKILLS_SHA: ${{ steps.skills.outputs.sha }}
+          SKILLS_SHORT: ${{ steps.skills.outputs.short }}
+          # Stamped into the hidden omni-bp-data block so /omni-fix can detect
+          # a moved branch (stale finding numbers).
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          USAGE=""
+          [ -f /tmp/bp/usage.json ] && USAGE="--usage /tmp/bp/usage.json"
+          # Only diff for newly-resolved findings when we actually reviewed
+          # (model changed). On the short-circuit path we carry the prior
+          # resolved ledger forward unchanged so a no-op push can't falsely
+          # "resolve" everything or wipe the ledger.
+          DIFF=""
+          [ "${{ steps.changed.outputs.count }}" != "0" ] && DIFF="--diff-resolved"
+          .github/scripts/format-best-practices.py \
+            --in /tmp/bp/findings.json --out body.md $USAGE \
+            --prior /tmp/bp/prior.json $DIFF
+          echo "----- body.md -----"
+          cat body.md
+
+      - name: Upsert sticky comment
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const upsert = require('./.github/scripts/upsert-comment.js');
+            const body = fs.readFileSync('body.md', 'utf8');
+            await upsert({ github, context, marker: 'omni-best-practices', body });
+
+      - name: Emit check-run annotations
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const annotate = require('./.github/scripts/post-check-annotations.js');
+            const doc = JSON.parse(fs.readFileSync('/tmp/bp/findings.json', 'utf8'));
+            await annotate({
+              github,
+              context,
+              findings: doc.findings || [],
+              summary: doc.summary || '',
+              name: 'Omni BP annotations',
+            });
+
+      - name: Fail on error-severity findings
+        run: |
+          set -euo pipefail
+          ERRS=$(python3 -c "import json;d=json.load(open('/tmp/bp/findings.json'));print(sum(1 for f in (d.get('findings') or []) if f.get('severity')=='error'))")
+          if [ "$ERRS" -gt 0 ]; then
+            echo "::error::$ERRS error-severity best-practice finding(s) in the changed YAML. (warnings/info are advisory)"
+            exit 1
+          fi
+          echo "No error-severity findings."
+
+  shared-model-hygiene:
+    # Block hand-authored base views in the shared model. A table-backed view
+    # must come from the schema layer; if a CHANGED view shows a top-level
+    # `table_name:` in EXTENSION mode it was authored by hand → violation.
+    # Provenance-accurate: the git file can't reveal origin (schema-origin and
+    # hand-authored views both carry table_name in git), but the API can —
+    # schema-origin table_name only appears in combined/resolved, not extension.
+    name: Shared-model hygiene
+    needs: model-validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Compute changed view YAML
+        id: changed
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          git fetch origin "$BASE_REF" --depth=50 || true
+          git diff --name-only "origin/${BASE_REF}...HEAD" \
+            -- "${OMNI_MODEL_DIR}/**/*.view.yaml" 2>/dev/null > /tmp/changed-views.txt || true
+          echo "Changed view files:"; cat /tmp/changed-views.txt || true
+
+      - name: Setup Omni CLI
+        uses: ./.github/actions/setup-omni-cli
+        with:
+          base-url: ${{ vars.OMNI_BASE_URL }}
+          token: ${{ secrets.OMNI_TOKEN }}
+
+      - name: Resolve Omni branch
+        id: resolve
+        env:
+          OMNI_MODEL_ID: ${{ vars.OMNI_MODEL_ID }}
+          GIT_REF: ${{ github.head_ref }}
+        run: .github/scripts/resolve-omni-branch.sh
+
+      - name: Check shared-model hygiene (extension mode)
+        env:
+          MODEL_ID: ${{ vars.OMNI_MODEL_ID }}
+          BRANCH_ID: ${{ steps.resolve.outputs.branch_id }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/check-shared-model-hygiene.py \
+            --model-id "$MODEL_ID" --branch-id "$BRANCH_ID" \
+            --files /tmp/changed-views.txt --out diff.json
+          echo "----- diff.json -----"; cat diff.json
+
+      - name: Upload section artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: omni-section-05-hygiene
+          path: diff.json
+          retention-days: 1
+
+      - name: Fail on violations
+        run: |
+          set -euo pipefail
+          ERRORS=$(python3 -c "import json;print(len(json.load(open('diff.json'))['errors']))")
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "::error::$ERRORS shared-model hygiene violation(s): base view(s) authored directly in the shared model."
+            exit 1
+          fi
+          echo "No shared-model hygiene violations."
+
+  validation-summary:
+    # ONE combined sticky comment for the four Omni validation checks.
+    # Each validation job uploads its rendered section as an artifact; this job
+    # downloads them and posts a single comment. Single writer => no comment
+    # races (the reason this can't just be a shared marker across parallel jobs).
+    # Advisory: per-check pass/fail status is still owned by the individual jobs.
+    # (Best-practices review keeps its own comment — it has annotations + cost.)
+    name: Validation summary
+    needs: [detect-changes, model-validate, content-validate, reference-queries, ai-evals, shared-model-hygiene]
+    # Run after the suite (always: so it posts even when a check failed), but
+    # not when the whole suite was skipped for a no-model-change PR.
+    if: always() && needs.detect-changes.outputs.model == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download section artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true   # tolerate missing sections (skipped jobs)
+        with:
+          pattern: omni-section-*
+          path: sections
+
+      - name: Assemble combined comment
+        env:
+          R_MODEL: ${{ needs.model-validate.result }}
+          R_CONTENT: ${{ needs.content-validate.result }}
+          R_REFERENCE: ${{ needs.reference-queries.result }}
+          R_AI: ${{ needs.ai-evals.result }}
+          R_HYGIENE: ${{ needs.shared-model-hygiene.result }}
+        run: |
+          python3 .github/scripts/assemble-validation-comment.py \
+            --sections-dir sections --out body.md
+          echo "----- body.md -----"
+          cat body.md
+
+      - name: Upsert combined sticky comment
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const upsert = require('./.github/scripts/upsert-comment.js');
+            const body = fs.readFileSync('body.md', 'utf8');
+            await upsert({ github, context, marker: 'omni-validation', body });

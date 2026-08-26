@@ -1,0 +1,15 @@
+name: date_spine_totals
+description: |
+  Total row count and total ISO boundary days across the full date spine.
+  Both numbers are deterministic — the spine generates 4018 dates from
+  2015-01-01 forward, and ISO year boundary days are a fixed calendar property.
+query:
+  table: "Date Spine"
+  fields:
+    - date_spine.count
+    - date_spine.boundary_dates
+  join_paths_from_topic_name: "Date Spine"
+expect:
+  row_count: 1
+  rows:
+    - [4018, 18]

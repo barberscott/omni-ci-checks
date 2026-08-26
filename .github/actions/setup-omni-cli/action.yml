@@ -1,0 +1,55 @@
+name: Setup Omni CLI
+description: Install the Omni CLI and configure a profile from GH secrets.
+
+inputs:
+  base-url:
+    description: Omni API base URL (e.g. https://example.omniapp.co).
+    required: true
+  token:
+    description: Omni API token.
+    required: true
+  profile:
+    description: Local profile name to write.
+    required: false
+    default: "ci"
+
+runs:
+  using: composite
+  steps:
+    - name: Install Omni CLI
+      shell: bash
+      run: |
+        set -euo pipefail
+        curl -fsSL https://raw.githubusercontent.com/exploreomni/cli/main/install.sh | sh
+        omni -v
+
+    - name: Write profile
+      shell: bash
+      env:
+        OMNI_BASE_URL: ${{ inputs.base-url }}
+        OMNI_TOKEN: ${{ inputs.token }}
+        PROFILE: ${{ inputs.profile }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$HOME/.config/omni-cli"
+        python3 - <<'PY'
+        import json, os
+        path = os.path.expanduser("~/.config/omni-cli/config.json")
+        profile = os.environ["PROFILE"]
+        cfg = {
+            "version": 1,
+            "defaultProfile": profile,
+            "profiles": {
+                profile: {
+                    "apiEndpoint": os.environ["OMNI_BASE_URL"],
+                    "authMethod": "api-key",
+                    "apiKey": os.environ["OMNI_TOKEN"],
+                }
+            },
+        }
+        with open(path, "w") as f:
+            json.dump(cfg, f)
+        os.chmod(path, 0o600)
+        PY
+        omni config show >/dev/null
+        echo "OMNI_PROFILE_NAME=${PROFILE}" >> "$GITHUB_ENV"

@@ -1,0 +1,31 @@
+name: iso_boundary_days_per_year
+description: |
+  Per-year ISO boundary days (days where ISO week year != Gregorian year).
+  These are deterministic calendar facts. Regression here means either the
+  iso_year_mismatch / boundary_dates field changed semantics, or the
+  underlying date spine generation changed.
+query:
+  table: "Date Spine"
+  fields:
+    - date_spine.event_date[year]
+    - date_spine.count
+    - date_spine.boundary_dates
+  sorts:
+    - column_name: date_spine.event_date[year]
+      sort_descending: false
+  limit: 100
+  join_paths_from_topic_name: "Date Spine"
+expect:
+  row_count: 11
+  rows:
+    - [2015, 365, 0]
+    - [2016, 366, 3]
+    - [2017, 365, 1]
+    - [2018, 365, 1]
+    - [2019, 365, 2]
+    - [2020, 366, 0]
+    - [2021, 365, 3]
+    - [2022, 365, 2]
+    - [2023, 365, 1]
+    - [2024, 366, 2]
+    - [2025, 365, 3]

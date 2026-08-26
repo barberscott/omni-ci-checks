@@ -100,12 +100,13 @@ passing, so required checks never wedge a PR.
 
 ## Customization
 
-- **Company rules** — edit
+- **Company standards** — edit
   [`.github/best-practices/omni-models.md`](.github/best-practices/omni-models.md).
   The substantive best practices come live from the `omni-agent-skills` repo;
-  this file supplies the stable rule-id taxonomy, the severity rubric, and a
-  **company-specific overrides** section that takes precedence when it
-  conflicts with the upstream skills.
+  this file is your company's layer on top of them: the severity rubric, the
+  stable rule-id taxonomy findings are labeled with, and your
+  **company-specific overrides and additions**, which take precedence when
+  they conflict with the upstream skills.
 - **Model directory** — if your git integration uses a custom `modelPath`,
   set the `OMNI_MODEL_DIR` variable to the directory that contains your model
   folder(s). The scripts map repo paths to Omni filenames assuming
@@ -124,7 +125,7 @@ passing, so required checks never wedge a PR.
     omni-fix.yml             The /omni-fix comment command
   actions/setup-omni-cli/    Composite action: install the Omni CLI, write a profile
   best-practices/
-    omni-models.md           Rule-id taxonomy, severity rubric, company overrides
+    omni-models.md           Company standards: severity rubric, rule-id taxonomy, overrides
   prompts/                   Prompts for the review and fix agents
   schemas/                   JSON schema for review findings
   scripts/                   The check/diff/format/apply machinery

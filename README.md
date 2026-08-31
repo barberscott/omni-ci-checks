@@ -78,11 +78,24 @@ Run both, or either. When both post findings, `/omni-fix` selectors resolve
 against the best-practices comment first, falling back to the agent review's
 comment when it is the only one present.
 
-### `/omni-fix` *(optional)*
+### `/omni-fix`
 
-Comment `/omni-fix <selectors>` on a PR to have Claude generate corrected YAML
-for selected best-practices findings and apply it **through Omni's API**
-(never a direct git write — Omni owns the repo contents). Selectors:
+Comment `/omni-fix <selectors>` on a PR to have an AI engine generate
+corrected YAML for selected best-practices findings and apply it **through
+Omni's API** (never a direct git write — Omni owns the repo contents). Two
+generation engines are available, chosen automatically: **Claude** when the
+`CLAUDE_CODE_OAUTH_TOKEN` secret is configured, otherwise **Omni's own
+modeling agent** via the Agentic Jobs API — which needs no extra secrets and
+draws on the same Omni credentials and AI credit allowance as the agent
+review. Set the `OMNI_FIX_ENGINE` repository variable to `claude` or
+`omni-agent` to pin one explicitly.
+
+Either engine only *generates* — Claude runs with no write tools, and the
+Omni agent is generate-only by prompt and by a staged-YAML fingerprint guard
+that aborts the run if the branch changed during drafting. The workflow then
+applies the output deterministically: write via the YAML endpoint, re-validate
+(any net-new **error** rolls everything back), and commit through Omni.
+Selectors:
 
 ```text
 /omni-fix 1.1            # one finding by its comment number
@@ -119,7 +132,8 @@ gh variable set OMNI_MODEL_ID --body "<shared model uuid>"
 | `OMNI_TOKEN` | secret | yes | Omni API token with access to the target model. |
 | `OMNI_BASE_URL` | variable | yes | Omni API base URL, e.g. `https://myorg.omniapp.co`. |
 | `OMNI_MODEL_ID` | variable | yes | The base **SHARED** model UUID this repo is git-linked to. |
-| `CLAUDE_CODE_OAUTH_TOKEN` | secret | no | API credential for the bring-your-own-provider review (the included implementation uses Claude; get a token with `claude setup-token`). Enables the best-practices review and `/omni-fix`; both skip cleanly when unset. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | secret | no | API credential for the bring-your-own-provider review (the included implementation uses Claude; get a token with `claude setup-token`). Enables the best-practices review and the Claude `/omni-fix` engine; the review skips cleanly when unset and `/omni-fix` falls back to the Omni agent engine. |
+| `OMNI_FIX_ENGINE` | variable | no | Pin the `/omni-fix` generation engine: `claude` or `omni-agent`. Default: automatic — Claude when its token is configured, the Omni agent otherwise. |
 | `OMNI_EVAL_PROMPT_SET_ID` | variable | no | An Omni eval prompt set UUID. Enables the AI evals check; skips when unset. |
 | `OMNI_MODEL_DIR` | variable | no | Directory the git integration writes model YAML into. Defaults to `omni` (Omni's default `modelPath` is `omni/<model name>`). |
 | `OMNI_SKILLS_SHA` | variable | no | Pin the best-practices review to a specific `omni-agent-skills` commit. Defaults to `main`. |

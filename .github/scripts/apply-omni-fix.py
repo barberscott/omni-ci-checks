@@ -101,6 +101,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--execution-file", default="")
     ap.add_argument("--structured-output", default="")
+    ap.add_argument("--result-json", default="",
+                    help="Path to a ready {files,delete,skipped} JSON document "
+                         "(the Omni-agent engine); takes precedence over the "
+                         "Claude execution outputs when the file exists")
     ap.add_argument("--fix-input", required=True)
     ap.add_argument("--model-id", required=True)
     ap.add_argument("--branch-id", required=True)
@@ -112,7 +116,16 @@ def main() -> int:
     # map omni_filename -> the finding ids targeted (for the summary)
     ids_for = {f["omni_filename"]: [x.get("id") for x in f.get("findings", [])] for f in fix_input.get("files", [])}
 
-    result = _extract_result(args.execution_file, args.structured_output)
+    result = None
+    if args.result_json and Path(args.result_json).is_file():
+        try:
+            candidate = json.loads(Path(args.result_json).read_text())
+            if isinstance(candidate, dict) and ("files" in candidate or "delete" in candidate):
+                result = candidate
+        except (json.JSONDecodeError, OSError):
+            result = None
+    if result is None:
+        result = _extract_result(args.execution_file, args.structured_output)
     out = Path(args.summary_md)
     if not result or (not result.get("files") and not result.get("delete")):
         out.write_text("## /omni-fix\n\n❌ Could not parse corrected YAML from the generation step. Nothing applied.\n")

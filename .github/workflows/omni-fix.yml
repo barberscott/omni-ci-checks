@@ -1,15 +1,23 @@
 name: Omni Fix
 
-# Selective fixer: comment `/omni-fix <selectors>` on a PR to have Claude
-# generate corrected model YAML for chosen best-practices findings and commit
-# it to the branch THROUGH OMNI (never a direct git write).
+# Selective fixer: comment `/omni-fix <selectors>` on a PR to have an AI
+# engine generate corrected model YAML for chosen best-practices findings and
+# commit it to the branch THROUGH OMNI (never a direct git write).
 #
 # Selectors: 1.1 · 3.3-3.5 · 2.* · errors|warnings|infos · rule:<id> · all
 #
-# Generate-then-apply: Claude only produces corrected YAML (no write tools);
-# this workflow applies it via `omni models yaml-create` + validate + commit.
-# Pre-flight + a late-bind re-check gate ensure we never write while Omni
-# Checks are in flight, and cancel cleanly if checks start mid-run.
+# Two generation engines, chosen automatically (override with the
+# OMNI_FIX_ENGINE repository variable — 'claude' or 'omni-agent'):
+#   - claude      when the CLAUDE_CODE_OAUTH_TOKEN secret is configured
+#   - omni-agent  otherwise — Omni's own modeling agent via the Agentic Jobs
+#                 API, using the same Omni credentials as every other check
+#
+# Generate-then-apply either way: the engine only produces corrected YAML
+# (Claude runs with no write tools; the Omni agent is generate-only by prompt
+# AND by a staged-YAML fingerprint guard); this workflow applies it via
+# `omni models yaml-create` + validate + commit. Pre-flight + a late-bind
+# re-check gate ensure we never write while Omni Checks are in flight, and
+# cancel cleanly if checks start mid-run.
 
 on:
   issue_comment:
@@ -51,15 +59,30 @@ jobs:
           gh api -X POST "repos/$REPO/issues/comments/$COMMENT_ID/reactions" -f content=eyes >/dev/null || true
           mkdir -p /tmp/omni-fix
 
-      - name: Require Claude token
+      - name: Choose fix engine
+        id: engine
         env:
           HAS_CLAUDE: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+          ENGINE_VAR: ${{ vars.OMNI_FIX_ENGINE }}
         run: |
           set -euo pipefail
-          if [ "$HAS_CLAUDE" != "true" ]; then
-            printf '## /omni-fix\n\n❌ The `CLAUDE_CODE_OAUTH_TOKEN` secret is not configured, so the fix generator cannot run. See the setup docs in the README.\n' > /tmp/omni-fix/result.md
-            exit 1
+          engine="${ENGINE_VAR:-auto}"
+          if [ "$engine" = "auto" ]; then
+            if [ "$HAS_CLAUDE" = "true" ]; then engine=claude; else engine=omni-agent; fi
           fi
+          case "$engine" in
+            claude)
+              if [ "$HAS_CLAUDE" != "true" ]; then
+                printf '## /omni-fix\n\n❌ `OMNI_FIX_ENGINE` is set to `claude` but the `CLAUDE_CODE_OAUTH_TOKEN` secret is not configured. Add the secret or unset the variable to fall back to the Omni agent engine.\n' > /tmp/omni-fix/result.md
+                exit 1
+              fi ;;
+            omni-agent) ;;
+            *)
+              printf '## /omni-fix\n\n❌ Unknown `OMNI_FIX_ENGINE` value `%s` — use `claude` or `omni-agent`.\n' "$engine" > /tmp/omni-fix/result.md
+              exit 1 ;;
+          esac
+          echo "Using fix engine: $engine"
+          echo "engine=$engine" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v6
 
@@ -95,6 +118,7 @@ jobs:
         run: .github/scripts/resolve-omni-branch.sh
 
       - name: Checkout skills
+        if: steps.engine.outputs.engine == 'claude'
         uses: actions/checkout@v6
         with:
           repository: exploreomni/omni-agent-skills
@@ -130,6 +154,7 @@ jobs:
           || { printf '## /omni-fix\n\n❌ Could not read current YAML for the selected files from the Omni branch.\n' > /tmp/omni-fix/result.md; exit 1; }
 
       - name: Build generation prompt
+        if: steps.engine.outputs.engine == 'claude'
         id: prompt
         run: |
           set -euo pipefail
@@ -162,6 +187,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Generate corrected YAML (Claude, no write tools)
+        if: steps.engine.outputs.engine == 'claude'
         id: claude
         uses: anthropics/claude-code-action@v1
         with:
@@ -172,6 +198,26 @@ jobs:
           claude_args: |
             --allowedTools Read
             --max-turns 15
+
+      - name: Generate corrected YAML (Omni agent, generate-only)
+        if: steps.engine.outputs.engine == 'omni-agent'
+        run: |
+          set +e
+          python3 .github/scripts/run-agent-fix.py "$MODEL_ID" \
+            --branch-id "${{ steps.branch.outputs.branch_id }}" \
+            --fix-input /tmp/omni-fix/fix-input.json \
+            --standards .github/best-practices/omni-models.md \
+            --prompt-head .github/prompts/omni-fix-agent.md \
+            --out /tmp/omni-fix/agent-result.json \
+            --meta-out /tmp/omni-fix/agent-meta.json
+          rc=$?
+          if [ "$rc" -eq 2 ]; then
+            printf '## /omni-fix\n\n❌ Aborted — the Omni agent modified the branch during what must be a generate-only step. **Nothing was applied.** Inspect the branch state before trusting it.\n' > /tmp/omni-fix/result.md
+            exit 1
+          elif [ "$rc" -ne 0 ]; then
+            printf '## /omni-fix\n\n❌ The Omni agent generation step failed. See the workflow log for details.\n' > /tmp/omni-fix/result.md
+            exit 1
+          fi
 
       - name: Re-check gate (late-bind cancel)
         run: |
@@ -195,11 +241,32 @@ jobs:
           python3 .github/scripts/apply-omni-fix.py \
             --execution-file '${{ steps.claude.outputs.execution_file }}' \
             --structured-output '${{ steps.claude.outputs.structured_output }}' \
+            --result-json /tmp/omni-fix/agent-result.json \
             --fix-input /tmp/omni-fix/fix-input.json \
             --model-id "$MODEL_ID" \
             --branch-id "${{ steps.branch.outputs.branch_id }}" \
             --summary-md /tmp/omni-fix/summary.md
           echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Stamp engine on summary
+        if: always()
+        run: |
+          set +e
+          if [ -f /tmp/omni-fix/summary.md ]; then
+            if [ -f /tmp/omni-fix/agent-meta.json ]; then
+              LINE=$(python3 -c "
+          import json
+          m = json.load(open('/tmp/omni-fix/agent-meta.json'))
+          bits = ['Generated by the Omni modeling agent (Agentic Jobs API)']
+          if m.get('job_id'):
+              bits.append('job ' + m['job_id'][:8])
+          print('_' + ' · '.join(bits) + '_')
+          ")
+              printf '\n%s\n' "$LINE" >> /tmp/omni-fix/summary.md
+            else
+              printf '\n_Generated by Claude (claude-code-action)_\n' >> /tmp/omni-fix/summary.md
+            fi
+          fi
 
       - name: Post result + reaction
         if: always()

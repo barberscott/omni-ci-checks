@@ -31,34 +31,52 @@ for required checks).
 | **Reference queries** | Runs pinned queries from `tests/reference-queries/` and compares results to expected values | Net-new failures |
 | **AI evals** *(optional)* | Runs an Omni eval prompt set against branch and base via the Eval Runs API | Net-new judged failures |
 | **Shared-model hygiene** | Flags hand-authored table-backed base views in the shared model (they must come from the schema layer) | Any violation |
-| **Omni agent review** | Omni's own modeling agent (via the Agentic Jobs API) reviews the PR's Omni branch against your company standards; findings appear as a PR comment + check-run annotations. No extra secrets — runs on your Omni API key and the instance's Omni AI credits | `error`-severity findings (warnings/info advisory) |
-| **Best-practices review** *(optional)* | Claude reviews the changed YAML against the full [omni-agent-skills](https://github.com/exploreomni/omni-agent-skills) docs; findings appear as a PR comment + check-run annotations | `error`-severity findings (warnings/info advisory) |
+| **Omni agent review** | Omni's built-in modeling agent reviews the PR's Omni branch against your company standards; findings appear as a PR comment + check-run annotations. No extra accounts or keys — it uses the same Omni credentials as the other checks | `error`-severity findings (warnings/info advisory) |
+| **Best-practices review** *(optional)* | An outside AI provider you supply a key for reviews the changed YAML against the full [omni-agent-skills](https://github.com/exploreomni/omni-agent-skills) docs; findings appear as a PR comment + check-run annotations. The included implementation uses Claude | `error`-severity findings (warnings/info advisory) |
 
 A **validation summary** job assembles the first five checks into one combined
 sticky PR comment. Each reviewer posts its own comment with numbered findings.
 
-### The two reviewers
+### The two review approaches
 
-Both reviewers share the severity rubric, rule-id taxonomy, and company
-overrides in `.github/best-practices/omni-models.md`, and both feed the same
-comment/annotation/`/omni-fix` pipeline. They differ in vantage point:
+Both reviewers check the PR against the same company standards file
+(`.github/best-practices/omni-models.md`) and produce the same kind of
+result: a PR comment with numbered findings, inline annotations, a check that
+fails on `error`-severity findings, and input for `/omni-fix`. They differ in
+where the reviewing intelligence comes from:
 
-- **Omni agent review** (default-on) asks Omni's own modeling agent to review
-  the **resolved model state on the PR's Omni branch** — schema-aware, and any
-  standards you keep in the model's own `ai_context` apply automatically. It
-  needs nothing beyond the Omni credentials the suite already has. Findings
-  carry no line numbers (the agent reads the resolved model, not the git
-  diff). The review is read-only by prompt contract *and* by guard: the runner
-  fingerprints the branch's staged YAML before and after, and hard-fails if
-  the agent wrote anything. Disable with `OMNI_AGENT_REVIEW=false` (e.g. if
-  your instance has AI disabled).
-- **Best-practices review** (opt-in via `CLAUDE_CODE_OAUTH_TOKEN`) reviews the
-  changed **git YAML** against the full, live `omni-agent-skills` docs, with
-  line-accurate annotations.
+**1. Built into Omni — the Omni agent review (on by default).** Omni ships
+its own modeling agent, and this check simply asks it to review the PR. There
+is nothing to sign up for and no new key to manage: it authenticates with the
+same Omni credentials the rest of the suite already uses, and each review
+draws on your Omni instance's AI credit allowance (see Requirements below).
+Because the agent works inside Omni, it reviews each changed file as Omni
+actually resolves it on the PR's branch — it sees the whole view, the
+database schema behind it, and any standards written into the model itself
+(`ai_context`), not just the lines the PR touched. The flip side: findings
+describe files, not line numbers, and can include pre-existing gaps in a file
+the PR merely edited. The review cannot change anything — the agent is
+instructed to only read, and the check independently compares the branch's
+content before and after the review and fails hard if anything changed.
+Disable with the `OMNI_AGENT_REVIEW=false` repository variable (for example,
+if your instance has AI features turned off).
+
+**2. Bring your own AI provider — the best-practices review (opt-in).** If
+you prefer an outside AI service to do the reviewing, create an account with
+a provider, generate an API key, and store it as a repository secret. This
+reviewer reads the changed files exactly as they appear in the git diff and
+judges them against the complete, current Omni modeling guides from the
+public `omni-agent-skills` repository — so its findings carry precise line
+numbers and its knowledge updates as those guides do. The implementation
+included here uses Anthropic's Claude (the `CLAUDE_CODE_OAUTH_TOKEN` secret
+and the `anthropics/claude-code-action` workflow step); treat it as a worked
+example of the approach rather than the only option — swapping in a
+different provider is a one-step change, described under
+[Customization](#customization).
 
 Run both, or either. When both post findings, `/omni-fix` selectors resolve
-against the Claude best-practices comment first, falling back to the agent
-review's comment when it is the only one present.
+against the best-practices comment first, falling back to the agent review's
+comment when it is the only one present.
 
 ### `/omni-fix` *(optional)*
 
@@ -101,11 +119,11 @@ gh variable set OMNI_MODEL_ID --body "<shared model uuid>"
 | `OMNI_TOKEN` | secret | yes | Omni API token with access to the target model. |
 | `OMNI_BASE_URL` | variable | yes | Omni API base URL, e.g. `https://myorg.omniapp.co`. |
 | `OMNI_MODEL_ID` | variable | yes | The base **SHARED** model UUID this repo is git-linked to. |
-| `CLAUDE_CODE_OAUTH_TOKEN` | secret | no | Token from `claude setup-token`. Enables the best-practices review and `/omni-fix`; both skip cleanly when unset. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | secret | no | API credential for the bring-your-own-provider review (the included implementation uses Claude; get a token with `claude setup-token`). Enables the best-practices review and `/omni-fix`; both skip cleanly when unset. |
 | `OMNI_EVAL_PROMPT_SET_ID` | variable | no | An Omni eval prompt set UUID. Enables the AI evals check; skips when unset. |
 | `OMNI_MODEL_DIR` | variable | no | Directory the git integration writes model YAML into. Defaults to `omni` (Omni's default `modelPath` is `omni/<model name>`). |
 | `OMNI_SKILLS_SHA` | variable | no | Pin the best-practices review to a specific `omni-agent-skills` commit. Defaults to `main`. |
-| `OMNI_AGENT_REVIEW` | variable | no | Set to `false` to disable the Omni agent review (it is on by default whenever model YAML changed). |
+| `OMNI_AGENT_REVIEW` | variable | no | Set to `false` to disable the Omni agent review (it is on by default whenever model YAML changed). Disable it if your Omni instance has AI features turned off. |
 
 ### 3. Add reference queries (recommended)
 
@@ -135,6 +153,26 @@ passing, so required checks never wedge a PR.
   set the `OMNI_MODEL_DIR` variable to the directory that contains your model
   folder(s). The scripts map repo paths to Omni filenames assuming
   `<OMNI_MODEL_DIR>/<model name>/<file>`.
+- **Using a different AI provider for the best-practices review** — the
+  Claude step is the only provider-specific piece; everything downstream
+  (comment, annotations, blocking, `/omni-fix`) reads one file: a findings
+  JSON matching [`.github/schemas/best-practices.json`](.github/schemas/best-practices.json):
+
+  ```json
+  {"summary": "...",
+   "findings": [{"file": "omni/.../orders.view.yaml", "line": 12,
+                 "severity": "warning", "rule": "missing-label",
+                 "message": "...", "suggestion": "..."}]}
+  ```
+
+  In the `best-practices-review` job, replace the `Run Claude review` and
+  `Capture Claude output` steps with anything that writes
+  `/tmp/bp/findings.json` in that shape — typically a small script that sends
+  your provider the same inputs the job already assembles (the review prompt
+  from `.github/prompts/best-practices-review.md`, the standards file, and
+  the changed YAML) and parses the reply. Keep `file` values repo-relative so
+  the inline annotations land on the right files. The Omni agent review needs
+  no provider at all and is unaffected.
 - **Dropping a check** — delete the job from
   `.github/workflows/omni-checks.yml` (and remove it from the
   `validation-summary` job's `needs:` list). To drop the fixer, delete
@@ -163,6 +201,11 @@ tests/
   creates/syncs Omni branches for PRs).
 - The Omni branch for a PR must exist before the checks run — with the
   standard integration setup this is automatic.
+- For the **Omni agent review**: AI features must be enabled on your Omni
+  instance, and each review consumes a small amount of the instance's Omni AI
+  credits (a one-file review takes well under a minute). Administrators can
+  cap spending in Omni under AI credit controls. If AI is disabled on the
+  instance, set the `OMNI_AGENT_REVIEW` variable to `false`.
 - Workflow permissions: the workflows request `contents: read`,
   `pull-requests: write`, `checks: write`, and `id-token: write` (the last is
   used by `anthropics/claude-code-action`).

@@ -365,7 +365,13 @@ jobs:
           echo "No net-new regressions."
 
   best-practices-review:
-    # Agentic review of the changed YAML against the FULL Omni agent skills.
+    # Review of the changed YAML against the FULL Omni agent skills, by an
+    # outside AI provider the repo supplies a key for. Claude is the included
+    # implementation; only the "Run Claude review" / "Capture Claude output"
+    # steps are provider-specific — any replacement that writes
+    # /tmp/bp/findings.json matching .github/schemas/best-practices.json
+    # keeps the rest of the job (comment, annotations, gating, /omni-fix)
+    # working unchanged. See README "Using a different AI provider".
     # Scoped to files touched by this PR. BLOCKS on `error`-severity findings;
     # `warning`/`info` are advisory (reported, never fail the check).
     #

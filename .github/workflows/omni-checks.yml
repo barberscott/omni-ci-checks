@@ -641,6 +641,148 @@ jobs:
           fi
           echo "No error-severity findings."
 
+  omni-agent-review:
+    # Best-practices review by OMNI'S OWN modeling agent via the Agentic Jobs
+    # API. Zero extra secrets: it authenticates with the same Omni API key as
+    # the validation jobs and runs on the instance's Omni AI credits — so it is
+    # the default reviewer, and complements the Claude job when both run.
+    # Differences from best-practices-review:
+    #   - Reviews the RESOLVED model state on the PR's Omni branch (schema-
+    #     aware; standards in the model's own ai_context apply automatically),
+    #     not the git diff text — findings carry no line numbers.
+    #   - Company standards come from .github/best-practices/omni-models.md,
+    #     inlined into the job prompt by the runner.
+    #   - Read-only by contract AND by guard: the runner fingerprints the
+    #     branch's staged YAML before/after and hard-fails if the agent wrote
+    #     anything.
+    # BLOCKS on error-severity findings; warnings/info are advisory — the same
+    # contract as best-practices-review. Set the OMNI_AGENT_REVIEW repository
+    # variable to 'false' to disable (e.g. when the instance has AI disabled).
+    name: Omni agent review
+    # Fail fast: skip if the model itself has net-new validation errors.
+    needs: model-validate
+    if: vars.OMNI_AGENT_REVIEW != 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Compute changed YAML
+        id: changed
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          git fetch origin "$BASE_REF" --depth=50 || true
+          git diff --name-only "origin/${BASE_REF}...HEAD" \
+            -- "${OMNI_MODEL_DIR}/**/*.yaml" "${OMNI_MODEL_DIR}/**/*.yml" \
+            2>/dev/null > /tmp/agent-changed.txt || true
+          echo "Changed YAML files:"; cat /tmp/agent-changed.txt
+
+      - name: Setup Omni CLI
+        uses: ./.github/actions/setup-omni-cli
+        with:
+          base-url: ${{ vars.OMNI_BASE_URL }}
+          token: ${{ secrets.OMNI_TOKEN }}
+
+      - name: Resolve Omni branch
+        id: resolve
+        env:
+          OMNI_MODEL_ID: ${{ vars.OMNI_MODEL_ID }}
+          GIT_REF: ${{ github.head_ref }}
+        run: .github/scripts/resolve-omni-branch.sh
+
+      - name: Run Omni agent review
+        env:
+          MODEL_ID: ${{ vars.OMNI_MODEL_ID }}
+          BRANCH_ID: ${{ steps.resolve.outputs.branch_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/agent
+          python3 .github/scripts/run-agent-review.py "$MODEL_ID" \
+            --branch-id "$BRANCH_ID" \
+            --files /tmp/agent-changed.txt \
+            --standards .github/best-practices/omni-models.md \
+            --prompt-head .github/prompts/agent-review.md \
+            --out /tmp/agent/findings.json \
+            --meta-out /tmp/agent/meta.json
+          echo "----- findings.json -----"
+          cat /tmp/agent/findings.json
+
+      - name: Fetch prior agent-review comment (for the resolved ledger)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            --paginate > /tmp/agent/comments.json || echo '[]' > /tmp/agent/comments.json
+          python3 .github/scripts/extract-bp-prior.py \
+            --comments /tmp/agent/comments.json \
+            --marker omni-agent-review \
+            --out /tmp/agent/prior.json
+
+      - name: Render comment body
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          FOOTER=$(python3 -c "
+          import json
+          try:
+              m = json.load(open('/tmp/agent/meta.json'))
+          except Exception:
+              m = {}
+          bits = ['Reviewed by the Omni modeling agent (Agentic Jobs API)']
+          if m.get('job_id'):
+              bits.append('job ' + m['job_id'][:8])
+          if isinstance(m.get('duration_ms'), (int, float)):
+              bits.append('%.0fs' % (m['duration_ms']/1000))
+          print(' · '.join(bits))
+          ")
+          .github/scripts/format-best-practices.py \
+            --in /tmp/agent/findings.json --out body.md \
+            --prior /tmp/agent/prior.json --diff-resolved \
+            --title "Omni agent review" \
+            --intro "_This check **fails on \`error\` findings**; warnings and info are advisory. Findings come from Omni's own modeling agent reviewing this PR's Omni branch against the company standards in \`.github/best-practices/omni-models.md\` (plus any standards in the model's \`ai_context\`)._" \
+            --footer-note "$FOOTER"
+          echo "----- body.md -----"
+          cat body.md
+
+      - name: Upsert sticky comment
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const upsert = require('./.github/scripts/upsert-comment.js');
+            const body = fs.readFileSync('body.md', 'utf8');
+            await upsert({ github, context, marker: 'omni-agent-review', body });
+
+      - name: Emit check-run annotations
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const annotate = require('./.github/scripts/post-check-annotations.js');
+            const doc = JSON.parse(fs.readFileSync('/tmp/agent/findings.json', 'utf8'));
+            await annotate({
+              github,
+              context,
+              findings: doc.findings || [],
+              summary: doc.summary || '',
+              name: 'Omni agent annotations',
+            });
+
+      - name: Fail on error-severity findings
+        run: |
+          set -euo pipefail
+          ERRS=$(python3 -c "import json;d=json.load(open('/tmp/agent/findings.json'));print(sum(1 for f in (d.get('findings') or []) if f.get('severity')=='error'))")
+          if [ "$ERRS" -gt 0 ]; then
+            echo "::error::$ERRS error-severity finding(s) from the Omni agent review. (warnings/info are advisory)"
+            exit 1
+          fi
+          echo "No error-severity findings."
+
   shared-model-hygiene:
     # Block hand-authored base views in the shared model. A table-backed view
     # must come from the schema layer; if a CHANGED view shows a top-level

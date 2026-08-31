@@ -4,9 +4,8 @@ A ready-to-use suite of GitHub Actions checks for [Omni](https://omni.co)
 model repositories. Drop it into a repo connected to Omni's
 [git integration](https://docs.omni.co/docs/integrations/git) and every pull
 request gets validated against your Omni instance — model validation, content
-validation, reference queries, AI evals, hygiene rules, and an AI
-best-practices review — with results posted as PR comments and enforced as
-required checks.
+validation, reference queries, AI evals, hygiene rules, and AI best-practices
+reviews — with results posted as PR comments and enforced as required checks.
 
 ## How it works
 
@@ -32,11 +31,34 @@ for required checks).
 | **Reference queries** | Runs pinned queries from `tests/reference-queries/` and compares results to expected values | Net-new failures |
 | **AI evals** *(optional)* | Runs an Omni eval prompt set against branch and base via the Eval Runs API | Net-new judged failures |
 | **Shared-model hygiene** | Flags hand-authored table-backed base views in the shared model (they must come from the schema layer) | Any violation |
+| **Omni agent review** | Omni's own modeling agent (via the Agentic Jobs API) reviews the PR's Omni branch against your company standards; findings appear as a PR comment + check-run annotations. No extra secrets — runs on your Omni API key and the instance's Omni AI credits | `error`-severity findings (warnings/info advisory) |
 | **Best-practices review** *(optional)* | Claude reviews the changed YAML against the full [omni-agent-skills](https://github.com/exploreomni/omni-agent-skills) docs; findings appear as a PR comment + check-run annotations | `error`-severity findings (warnings/info advisory) |
 
 A **validation summary** job assembles the first five checks into one combined
-sticky PR comment. The best-practices review posts its own comment with
-numbered findings.
+sticky PR comment. Each reviewer posts its own comment with numbered findings.
+
+### The two reviewers
+
+Both reviewers share the severity rubric, rule-id taxonomy, and company
+overrides in `.github/best-practices/omni-models.md`, and both feed the same
+comment/annotation/`/omni-fix` pipeline. They differ in vantage point:
+
+- **Omni agent review** (default-on) asks Omni's own modeling agent to review
+  the **resolved model state on the PR's Omni branch** — schema-aware, and any
+  standards you keep in the model's own `ai_context` apply automatically. It
+  needs nothing beyond the Omni credentials the suite already has. Findings
+  carry no line numbers (the agent reads the resolved model, not the git
+  diff). The review is read-only by prompt contract *and* by guard: the runner
+  fingerprints the branch's staged YAML before and after, and hard-fails if
+  the agent wrote anything. Disable with `OMNI_AGENT_REVIEW=false` (e.g. if
+  your instance has AI disabled).
+- **Best-practices review** (opt-in via `CLAUDE_CODE_OAUTH_TOKEN`) reviews the
+  changed **git YAML** against the full, live `omni-agent-skills` docs, with
+  line-accurate annotations.
+
+Run both, or either. When both post findings, `/omni-fix` selectors resolve
+against the Claude best-practices comment first, falling back to the agent
+review's comment when it is the only one present.
 
 ### `/omni-fix` *(optional)*
 
@@ -83,6 +105,7 @@ gh variable set OMNI_MODEL_ID --body "<shared model uuid>"
 | `OMNI_EVAL_PROMPT_SET_ID` | variable | no | An Omni eval prompt set UUID. Enables the AI evals check; skips when unset. |
 | `OMNI_MODEL_DIR` | variable | no | Directory the git integration writes model YAML into. Defaults to `omni` (Omni's default `modelPath` is `omni/<model name>`). |
 | `OMNI_SKILLS_SHA` | variable | no | Pin the best-practices review to a specific `omni-agent-skills` commit. Defaults to `main`. |
+| `OMNI_AGENT_REVIEW` | variable | no | Set to `false` to disable the Omni agent review (it is on by default whenever model YAML changed). |
 
 ### 3. Add reference queries (recommended)
 
@@ -94,7 +117,8 @@ for the fixture format and worked examples.
 
 In `Settings → Branches`, require the checks you care about (e.g.
 `Model validation`, `Content validation`, `Reference queries`,
-`Shared-model hygiene`, `Best practices review`) on your base branch. Skipped
+`Shared-model hygiene`, `Omni agent review`, `Best practices review`) on your
+base branch. Skipped
 runs (no model YAML changed, or an optional feature unconfigured) report as
 passing, so required checks never wedge a PR.
 

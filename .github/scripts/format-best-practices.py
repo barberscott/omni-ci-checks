@@ -177,26 +177,35 @@ def _usage_footer(usage_path: str | None) -> str:
     return f"\n_Review cost: {' · '.join(bits)}._"
 
 
+DEFAULT_TITLE = "Omni best-practices review"
+DEFAULT_INTRO = (
+    "_This check **fails on `error` findings**; warnings and info are advisory. "
+    "Findings come from Claude reviewing the changed YAML against the full "
+    "`omni-agent-skills` skill docs._"
+)
+
+
 def render(
     doc: dict,
     usage_path: str | None = None,
     prior: dict | None = None,
     diff_resolved: bool = False,
+    title: str = DEFAULT_TITLE,
+    intro: str = DEFAULT_INTRO,
+    footer_note: str = "",
 ) -> str:
     findings = doc.get("findings") or []
     summary = (doc.get("summary") or "").strip()
     footer = _provenance_footer() + _usage_footer(usage_path)
+    if footer_note.strip():
+        footer += f"\n\n---\n_{footer_note.strip()}_"
     resolved = _compute_resolved(findings, prior, diff_resolved)
     capsule = _resolved_capsule(resolved)
 
     lines: list[str] = []
-    lines.append("## Omni best-practices review")
+    lines.append(f"## {title}")
     lines.append("")
-    lines.append(
-        "_This check **fails on `error` findings**; warnings and info are advisory. "
-        "Findings come from Claude reviewing the changed YAML against the full "
-        "`omni-agent-skills` skill docs._"
-    )
+    lines.append(intro)
     lines.append("")
 
     if not findings:
@@ -284,6 +293,12 @@ def main() -> int:
         help="Compute newly-resolved findings by diffing prior vs current "
              "(only when we actually reviewed; off on the short-circuit path).",
     )
+    ap.add_argument("--title", default=DEFAULT_TITLE,
+                    help="Comment heading (per-reviewer).")
+    ap.add_argument("--intro", default=DEFAULT_INTRO,
+                    help="Intro line under the heading (per-reviewer).")
+    ap.add_argument("--footer-note", default="",
+                    help="Extra italicized footer line (e.g. agent-job provenance).")
     args = ap.parse_args()
 
     raw = Path(args.inp).read_text() if Path(args.inp).exists() else args.inp
@@ -303,7 +318,9 @@ def main() -> int:
         except (json.JSONDecodeError, OSError):
             prior = None
 
-    body = render(doc, usage_path=args.usage, prior=prior, diff_resolved=args.diff_resolved)
+    body = render(doc, usage_path=args.usage, prior=prior,
+                  diff_resolved=args.diff_resolved, title=args.title,
+                  intro=args.intro, footer_note=args.footer_note)
     Path(args.out).write_text(body)
     print(body, file=sys.stderr)
     return 0

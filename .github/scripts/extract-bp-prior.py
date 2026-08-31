@@ -16,13 +16,16 @@ import re
 from pathlib import Path
 
 DATA_RE = re.compile(r"<!--\s*omni-bp-data:v1\s+([A-Za-z0-9+/=]+)\s*-->")
-BP_MARKER = "<!-- omni-best-practices -->"
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--comments", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--marker", default="omni-best-practices",
+                    help="Sticky-comment marker whose data block to read. Only "
+                         "that reviewer's comment is considered, so the Claude "
+                         "and Omni-agent ledgers can't cross-contaminate.")
     args = ap.parse_args()
 
     try:
@@ -30,8 +33,8 @@ def main() -> int:
     except Exception:
         comments = []
 
-    candidates = [c for c in comments if BP_MARKER in (c.get("body") or "")]
-    candidates += [c for c in comments if c not in candidates]
+    tag = f"<!-- {args.marker} -->"
+    candidates = [c for c in comments if tag in (c.get("body") or "")]
 
     out: dict = {}
     for c in candidates:

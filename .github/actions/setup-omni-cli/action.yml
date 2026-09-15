@@ -31,6 +31,14 @@ runs:
         PROFILE: ${{ inputs.profile }}
       run: |
         set -euo pipefail
+        if [ -z "${OMNI_TOKEN:-}" ]; then
+          echo "::error::No Omni API token was passed to setup-omni-cli. The checks read the OMNI_API_KEY repository secret (shared with OmniFlow) and /omni-fix reads OMNI_FIX_API_KEY; set the missing one under Settings → Secrets and variables → Actions."
+          exit 1
+        fi
+        if [ -z "${OMNI_BASE_URL:-}" ]; then
+          echo "::error::No Omni base URL was passed to setup-omni-cli. It comes from base_url in .omni/flow.json on the base branch."
+          exit 1
+        fi
         mkdir -p "$HOME/.config/omni-cli"
         python3 - <<'PY'
         import json, os

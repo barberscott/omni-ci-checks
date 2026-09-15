@@ -1,23 +1,42 @@
 # Omni CI Checks
 
-A ready-to-use suite of GitHub Actions checks for [Omni](https://omni.co)
-model repositories. Drop it into a repo connected to Omni's
-[git integration](https://docs.omni.co/docs/integrations/git) and every pull
-request gets validated against your Omni instance — model validation, content
-validation, reference queries, AI evals, hygiene rules, and AI best-practices
-reviews — with results posted as PR comments and enforced as required checks.
+GitHub Actions checks for [Omni](https://omni.co) model repositories that
+**[OmniFlow](https://github.com/exploreomni/OmniFlow) does not run**. Use the
+two together: OmniFlow is Omni's own CI action and owns model validation,
+content validation, semantic diff, downstream contracts, and the dbt
+sequencing policies. This repo adds the checks that need a live query, an AI
+reviewer, or a write-back fixer, and stays out of OmniFlow's way.
+
+| Need | Where it lives |
+|------|----------------|
+| Model validation, content validation, semantic lint | OmniFlow |
+| Semantic diff, breaking-change detection, downstream contract search | OmniFlow |
+| dbt impact analysis, breaking-change hold, post-deploy dbt sync | OmniFlow |
+| AI eval regression check | OmniFlow (opt-in) |
+| **Reference queries** with pinned results | this repo |
+| **Shared-model hygiene** (provenance of table-backed views) | this repo |
+| **Omni agent review** against company standards | this repo |
+| **Best-practices review** by an outside AI provider | this repo (opt-in) |
+| **`/omni-fix`** comment command that applies fixes through Omni's API | this repo |
+
+Install OmniFlow first, following
+[its installation guide](https://github.com/exploreomni/OmniFlow/blob/main/docs/INSTALLATION.md).
+Then drop this repo's `.github/` and `tests/` alongside it. The checks reuse
+OmniFlow's `.omni/flow.json` for the model identity and its `OMNI_API_KEY`
+secret for read and query access, so there is nothing to configure twice.
+Neither depends on the other at runtime.
 
 ## How it works
 
-Every check runs the same validation twice — once against the PR's **Omni
-branch**, once against the **base model** — and reports only **net-new**
-issues introduced by the PR. Pre-existing problems in the model never block a
+Where a check has a base to compare against, it runs twice, once against the
+PR's **Omni branch** and once against the **base model**, and reports only
+**net-new** issues introduced by the PR. Pre-existing problems never block a
 PR; new ones do.
 
 The suite assumes Omni's git integration branch convention: **the git branch
-name and the Omni branch name match 1:1**. When Omni opens a PR from a branch
-(or you push to a branch that mirrors an Omni branch), the workflows resolve
-the Omni branch by name and validate against it.
+name and the Omni branch name match 1:1**. When Omni opens a PR from a branch,
+the workflows resolve the Omni branch by name and check against it. This is
+the same convention OmniFlow uses.
 
 PRs that touch no model YAML skip the whole suite (the skips count as passing
 for required checks).
@@ -26,16 +45,22 @@ for required checks).
 
 | Check | What it does | Blocks on |
 |-------|--------------|-----------|
-| **Model validation** | `omni models validate` on branch vs base | Net-new validation errors |
-| **Content validation** | Omni's content validator (dashboards/workbooks broken by the change) on branch vs base | Net-new content errors |
-| **Reference queries** | Runs pinned queries from `tests/reference-queries/` and compares results to expected values | Net-new failures |
-| **AI evals** *(optional)* | Runs an Omni eval prompt set against branch and base via the Eval Runs API | Net-new judged failures |
-| **Shared-model hygiene** | Flags hand-authored table-backed base views in the shared model (they must come from the schema layer) | Any violation |
+| **Reference queries** | Runs pinned queries from `tests/reference-queries/` on branch and base and compares results to expected values | Net-new failures |
+| **Shared-model hygiene** | Flags hand-authored table-backed base views in the shared model (they must come from the schema layer). Detection asks Omni for each changed view in extension mode, which the git file alone cannot reveal | Any violation |
 | **Omni agent review** | Omni's built-in modeling agent reviews the PR's Omni branch against your company standards; findings appear as a PR comment + check-run annotations. No extra accounts or keys — it uses the same Omni credentials as the other checks | `error`-severity findings (warnings/info advisory) |
-| **Best-practices review** *(optional)* | An outside AI provider you supply a key for reviews the changed YAML against the full [omni-agent-skills](https://github.com/exploreomni/omni-agent-skills) docs; findings appear as a PR comment + check-run annotations. The included implementation uses Claude | `error`-severity findings (warnings/info advisory) |
+| **Best-practices review** *(optional)* | An outside AI provider you supply a key for reviews the changed YAML against the full [omni-agent-skills](https://github.com/exploreomni/omni-agent-skills) docs; findings appear as a PR comment + check-run annotations with line numbers. The included implementation uses Claude | `error`-severity findings (warnings/info advisory) |
 
-A **validation summary** job assembles the first five checks into one combined
+A **validation summary** job assembles the first two checks into one combined
 sticky PR comment. Each reviewer posts its own comment with numbered findings.
+
+### Why these are not in OmniFlow
+
+OmniFlow's core validation deliberately executes no warehouse queries and
+writes no YAML. Reference queries run real queries by design, and `/omni-fix`
+writes to Omni branches by design. The two reviewers depend on an AI agent
+(Omni's or an outside provider's) rather than deterministic validation. Those
+are reasonable things to keep out of a required check that ships as an
+official action, and reasonable things to want as an optional layer beside it.
 
 ### The two review approaches
 
@@ -107,7 +132,9 @@ Selectors:
 ```
 
 Only users with write access can trigger it, and it refuses to run while Omni
-Checks are in flight on the head commit.
+Checks are in flight on the head commit. It does not wait for OmniFlow; run it
+after OmniFlow has reported so the re-validation inside the fixer and
+OmniFlow's own check agree on the branch state.
 
 ## Getting started
 
@@ -115,44 +142,72 @@ Checks are in flight on the head commit.
 
 Either click **Use this template** and connect Omni's git integration to the
 new repo, or copy `.github/` and `tests/` into your existing Omni-connected
-repo.
+repo. If OmniFlow is already installed, nothing here collides with it: the
+workflow names, comment markers, secrets, and variables are all distinct.
 
-### 2. Configure secrets and variables
+### 2. Point the checks at your model
+
+The model identity comes from OmniFlow's `.omni/flow.json` on the base
+branch, so if OmniFlow is installed there is nothing to add. Without OmniFlow,
+create the file from
+[OmniFlow's example](https://github.com/exploreomni/OmniFlow/blob/main/.omni/flow.example.json):
+
+```json
+{
+  "version": 1,
+  "models": [
+    {
+      "base_url": "https://myorg.omniapp.co",
+      "model_id": "<shared model uuid>",
+      "model_path": "omni/my_model",
+      "base_branch": "main"
+    }
+  ]
+}
+```
+
+`model_path` is the directory the git integration writes model YAML into
+(Omni's default `modelPath` is `omni/<model name>`). The checks read the file
+from the base branch on every PR, so a pull request cannot redirect the token
+by editing it. Several models may be registered; a PR must touch only one.
+
+### 3. Configure secrets and variables
 
 `Settings → Secrets and variables → Actions`, or via `gh`:
 
 ```bash
-gh secret set OMNI_TOKEN --body "<omni api token>"
-gh variable set OMNI_BASE_URL --body "https://<instance>.omniapp.co"
-gh variable set OMNI_MODEL_ID --body "<shared model uuid>"
+gh secret set OMNI_API_KEY --body "<read/query token>"
+```
+
+```bash
+gh secret set OMNI_FIX_API_KEY --body "<write-capable token, only if you use /omni-fix>"
 ```
 
 | Name | Kind | Required | Description |
 |------|------|----------|-------------|
-| `OMNI_TOKEN` | secret | yes | Omni API token with access to the target model. |
-| `OMNI_BASE_URL` | variable | yes | Omni API base URL, e.g. `https://myorg.omniapp.co`. |
-| `OMNI_MODEL_ID` | variable | yes | The base **SHARED** model UUID this repo is git-linked to. |
+| `OMNI_API_KEY` | secret | yes | The same secret OmniFlow uses: a personal access token for a dedicated least-privilege Omni user. On top of what OmniFlow needs, that user must be able to run queries (reference queries) and start AI jobs (Omni agent review). |
+| `OMNI_FIX_API_KEY` | secret | for `/omni-fix` | A separate token whose user can write model YAML and commit through Omni. Only the fixer workflow receives it, mirroring OmniFlow's split between its validation key and its repair key. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | secret | no | API credential for the bring-your-own-provider review (the included implementation uses Claude; get a token with `claude setup-token`). Enables the best-practices review and the Claude `/omni-fix` engine; the review skips cleanly when unset and `/omni-fix` falls back to the Omni agent engine. |
 | `OMNI_FIX_ENGINE` | variable | no | Pin the `/omni-fix` generation engine: `claude` or `omni-agent`. Default: automatic — Claude when its token is configured, the Omni agent otherwise. |
-| `OMNI_EVAL_PROMPT_SET_ID` | variable | no | An Omni eval prompt set UUID. Enables the AI evals check; skips when unset. |
-| `OMNI_MODEL_DIR` | variable | no | Directory the git integration writes model YAML into. Defaults to `omni` (Omni's default `modelPath` is `omni/<model name>`). |
 | `OMNI_SKILLS_SHA` | variable | no | Pin the best-practices review to a specific `omni-agent-skills` commit. Defaults to `main`. |
 | `OMNI_AGENT_REVIEW` | variable | no | Set to `false` to disable the Omni agent review (it is on by default whenever model YAML changed). Disable it if your Omni instance has AI features turned off. |
 
-### 3. Add reference queries (recommended)
+These knobs stay as repository variables rather than going into
+`.omniflow.yml`, because OmniFlow rejects unknown keys in its policy file.
+
+### 4. Add reference queries (recommended)
 
 Pin the numbers that must never silently change — row counts, totals, KPI
 values. See [tests/reference-queries/README.md](tests/reference-queries/README.md)
 for the fixture format and worked examples.
 
-### 4. Make the checks required (recommended)
+### 5. Make the checks required (recommended)
 
 In `Settings → Branches`, require the checks you care about (e.g.
-`Model validation`, `Content validation`, `Reference queries`,
-`Shared-model hygiene`, `Omni agent review`, `Best practices review`) on your
-base branch. Skipped
-runs (no model YAML changed, or an optional feature unconfigured) report as
-passing, so required checks never wedge a PR.
+`Reference queries`, `Shared-model hygiene`, `Omni agent review`,
+`Best practices review`) on your base branch, alongside OmniFlow's check.
+Skipped runs (no model YAML changed, or an optional feature unconfigured)
+report as passing, so required checks never wedge a PR.
 
 ## Customization
 
@@ -163,10 +218,10 @@ passing, so required checks never wedge a PR.
   stable rule-id taxonomy findings are labeled with, and your
   **company-specific overrides and additions**, which take precedence when
   they conflict with the upstream skills.
-- **Model directory** — if your git integration uses a custom `modelPath`,
-  set the `OMNI_MODEL_DIR` variable to the directory that contains your model
-  folder(s). The scripts map repo paths to Omni filenames assuming
-  `<OMNI_MODEL_DIR>/<model name>/<file>`.
+- **Model directory** — the scripts map repo paths to Omni filenames assuming
+  `<parent of model_path>/<model name>/<file>`, which is Omni's default
+  `modelPath` shape. If your git integration uses a different layout, adjust
+  `git_path_to_omni_filename()` in the scripts.
 - **Using a different AI provider for the best-practices review** — the
   Claude step is the only provider-specific piece; everything downstream
   (comment, annotations, blocking, `/omni-fix`) reads one file: a findings
@@ -205,6 +260,8 @@ passing, so required checks never wedge a PR.
   prompts/                   Prompts for the review and fix agents
   schemas/                   JSON schema for review findings
   scripts/                   The check/diff/format/apply machinery
+.omni/
+  flow.json                  OmniFlow's model identity file (shared, not duplicated)
 tests/
   reference-queries/         Your pinned-query fixtures (examples/ inside)
 ```
@@ -224,12 +281,23 @@ tests/
   `pull-requests: write`, `checks: write`, and `id-token: write` (the last is
   used by `anthropics/claude-code-action`).
 
+## History
+
+Earlier versions of this repo also ran model validation, content validation,
+and an AI eval regression check, and carried their own `OMNI_BASE_URL`,
+`OMNI_MODEL_ID`, `OMNI_MODEL_DIR` variables and `OMNI_TOKEN` secret. OmniFlow
+now covers all three checks with tests and a release process behind it, so
+those jobs were removed rather than maintained in parallel, and the
+configuration moved to OmniFlow's shapes. The last commit that carried the
+old suite is tagged `v0-full-suite` if you need it.
+
 ## License and disclaimer
 
 MIT — see [LICENSE](LICENSE).
 
 This project is provided **as-is**, without warranty of any kind, express or
 implied, and without any guarantee of support or maintenance. It is not an
-official Omni product. Review the workflows before enabling them — they call
-your Omni instance's API with the credentials you configure, and `/omni-fix`
-writes model changes to Omni branches.
+official Omni product and is not affiliated with OmniFlow. Review the
+workflows before enabling them — they call your Omni instance's API with the
+credentials you configure, and `/omni-fix` writes model changes to Omni
+branches.

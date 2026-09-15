@@ -10,7 +10,10 @@ name: Omni Fix
 # OMNI_FIX_ENGINE repository variable — 'claude' or 'omni-agent'):
 #   - claude      when the CLAUDE_CODE_OAUTH_TOKEN secret is configured
 #   - omni-agent  otherwise — Omni's own modeling agent via the Agentic Jobs
-#                 API, using the same Omni credentials as every other check
+#                 API, needing no extra provider key
+#
+# Credentials follow OmniFlow's split: the checks run on the read-only
+# OMNI_API_KEY; this workflow alone gets the write-capable OMNI_FIX_API_KEY.
 #
 # Generate-then-apply either way: the engine only produces corrected YAML
 # (Claude runs with no write tools; the Omni agent is generate-only by prompt
@@ -48,11 +51,8 @@ jobs:
       PR_NUMBER: ${{ github.event.issue.number }}
       COMMENT_ID: ${{ github.event.comment.id }}
       COMMENT_BODY: ${{ github.event.comment.body }}
-      MODEL_ID: ${{ vars.OMNI_MODEL_ID }}
-      # Directory the Omni git integration writes model YAML into (used to map
-      # repo paths to Omni model filenames). Omni's default modelPath is
-      # `omni/<model name>`; set the OMNI_MODEL_DIR variable to override.
-      OMNI_MODEL_DIR: ${{ vars.OMNI_MODEL_DIR || 'omni' }}
+      # MODEL_ID, OMNI_BASE_URL and OMNI_MODEL_DIR are set by the "Read Omni
+      # config" step below from OmniFlow's `.omni/flow.json`.
     steps:
       - name: Acknowledge
         run: |
@@ -86,6 +86,25 @@ jobs:
 
       - uses: actions/checkout@v6
 
+      - name: Read Omni config
+        # issue_comment runs on the default branch, so the working-tree copy
+        # of .omni/flow.json is already the trusted one.
+        env:
+          HAS_FIX_KEY: ${{ secrets.OMNI_FIX_API_KEY != '' }}
+        run: |
+          set -euo pipefail
+          if [ "$HAS_FIX_KEY" != "true" ]; then
+            printf '## /omni-fix\n\n❌ The `OMNI_FIX_API_KEY` secret is not configured. `/omni-fix` writes to Omni branches and needs its own write-capable token, separate from the read-only `OMNI_API_KEY` the checks use.\n' > /tmp/omni-fix/result.md
+            exit 1
+          fi
+          python3 .github/scripts/read-flow-config.py > /tmp/omni-fix/config.env
+          cat /tmp/omni-fix/config.env
+          {
+            echo "MODEL_ID=$(grep '^model_id=' /tmp/omni-fix/config.env | cut -d= -f2-)"
+            echo "OMNI_BASE_URL=$(grep '^base_url=' /tmp/omni-fix/config.env | cut -d= -f2-)"
+            echo "OMNI_MODEL_DIR=$(grep '^model_dir=' /tmp/omni-fix/config.env | cut -d= -f2-)"
+          } >> "$GITHUB_ENV"
+
       - name: Resolve PR
         id: pr
         run: |
@@ -107,13 +126,13 @@ jobs:
       - name: Setup Omni CLI
         uses: ./.github/actions/setup-omni-cli
         with:
-          base-url: ${{ vars.OMNI_BASE_URL }}
-          token: ${{ secrets.OMNI_TOKEN }}
+          base-url: ${{ env.OMNI_BASE_URL }}
+          token: ${{ secrets.OMNI_FIX_API_KEY }}
 
       - name: Resolve Omni branch
         id: branch
         env:
-          OMNI_MODEL_ID: ${{ vars.OMNI_MODEL_ID }}
+          OMNI_MODEL_ID: ${{ env.MODEL_ID }}
           GIT_REF: ${{ steps.pr.outputs.head_ref }}
         run: .github/scripts/resolve-omni-branch.sh
 

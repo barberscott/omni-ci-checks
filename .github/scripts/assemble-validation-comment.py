@@ -10,9 +10,9 @@ to render a single comment:
      branch/base totals).
   2. Collapsible per-check details for any check with net-new findings.
 
-Per-job results are passed via env (R_MODEL / R_CONTENT / R_REFERENCE / R_AI)
-so the status column is accurate even for skipped checks (which have no
-diff.json because a prerequisite — model-validate — failed).
+Per-job results are passed via env (R_REFERENCE / R_HYGIENE) so the status
+column is accurate even for skipped or cancelled checks (which have no
+diff.json).
 """
 
 from __future__ import annotations
@@ -25,10 +25,7 @@ from pathlib import Path
 
 # (artifact dir, human label, env var holding the job's result)
 SECTIONS = [
-    ("omni-section-01-model", "Model validation", "R_MODEL"),
-    ("omni-section-02-content", "Content validation", "R_CONTENT"),
     ("omni-section-03-reference", "Reference queries", "R_REFERENCE"),
-    ("omni-section-04-ai", "AI evals", "R_AI"),
     ("omni-section-05-hygiene", "Shared-model hygiene", "R_HYGIENE"),
 ]
 
@@ -124,8 +121,9 @@ def main() -> int:
     parts.append("## Omni validation summary")
     parts.append("")
     parts.append(
-        "_Combined status of the model, content, reference-query, and AI-query "
-        "checks. Each check still owns its pass/fail status above._"
+        "_Combined status of the reference-query and shared-model hygiene "
+        "checks. Each check still owns its pass/fail status above. Model and "
+        "content validation are reported separately by OmniFlow._"
     )
     parts.append("")
     parts.append("| Check | Status | Net-new | Resolved | Branch / Base |")
